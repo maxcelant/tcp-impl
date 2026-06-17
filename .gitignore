@@ -1,8 +1,3 @@
-# Binaries built by user
-/cmd/*/tcpdump-lite
-/cmd/*/icmp-echo
-/cmd/*/tcp-echo
-/cmd/*/curl-lite
 tcpdump-lite
 icmp-echo
 tcp-echo
