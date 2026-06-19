@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/netip"
 
@@ -16,8 +17,10 @@ func main() {
 	for {
 		// Accept blocks; it won't return until ESTABLISHED (L08).
 		// The read loop inside Listen still emits the SYN/ACK.
-		if _, err := ln.Accept(); err != nil {
+		conn, err := ln.Accept()
+		if err != nil {
 			log.Fatal(err)
 		}
+		fmt.Printf("Conn State: %s\n", conn.State())
 	}
 }
