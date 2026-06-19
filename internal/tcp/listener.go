@@ -1,8 +1,9 @@
 package tcp
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/netip"
 	"strconv"
 
@@ -11,14 +12,31 @@ import (
 	"github.com/maxcelant/tcp-from-scratch/internal/tun"
 )
 
+type ctxKey struct{}
+
+var loggerKey = ctxKey{}
+
 type Listener struct {
 	local  netip.AddrPort
 	demux  *demux
 	device *tun.Device
 	connCh chan *Conn
+	logger *slog.Logger
 }
 
-func Listen(local netip.AddrPort) (*Listener, error) {
+func WithLogger(ctx context.Context, l *slog.Logger) context.Context {
+	return context.WithValue(ctx, loggerKey, l)
+}
+
+func FromContext(ctx context.Context) *slog.Logger {
+	if l, ok := ctx.Value(loggerKey).(*slog.Logger); ok {
+		return l
+	}
+	return slog.Default()
+}
+
+func Listen(ctx context.Context, local netip.AddrPort) (*Listener, error) {
+	logger := FromContext(ctx)
 	d, err := tun.Open("tun0")
 	if err != nil {
 		return nil, err
@@ -29,6 +47,7 @@ func Listen(local netip.AddrPort) (*Listener, error) {
 		demux:  NewDemux(),
 		device: d,
 		connCh: make(chan *Conn, 100),
+		logger: logger,
 	}
 
 	buf := make([]byte, 1500)
@@ -36,21 +55,21 @@ func Listen(local netip.AddrPort) (*Listener, error) {
 		for {
 			i, err := l.device.Read(buf)
 			if err != nil {
-				log.Printf("listener(error): failed to read for device: %s: %s\n", l.device.Name(), err.Error())
+				logger.Error("listener: failed to read from device", "name", l.device.Name(), "error", err.Error())
 				return
 			}
 			ip, payload, err := ipv4.Parse(buf[:i])
 			if err != nil {
-				log.Printf("listener(error): error occured while parsing buffer: %s\n", err.Error())
+				logger.Error("listener: failed to parse IP packet", "error", err)
 				continue
 			}
 			if !ip.IsProtocol(ipv4.ProtoTCP) {
-				log.Println("listener(error): protocol for packet is not TCP, skipping")
+				logger.Debug("listener: packet protocol is not TCP, skipping")
 				continue
 			}
 			seg, payload, err := Parse(payload[:i])
 			if err != nil {
-				log.Printf("listener(error): failure occured while parsing buffer: %s\n", err.Error())
+				logger.Error("listener: failed to parse TCP segment", "error", err)
 				continue
 			}
 			connKey := connKey{
@@ -87,17 +106,17 @@ func Listen(local netip.AddrPort) (*Listener, error) {
 				}
 				if seg.Flags != FlagSYN {
 					// TODO Send RST
-					log.Println("listener(warning): received new connection without SYN flag")
+					logger.Warn("listener: received new connection without SYN flag")
 					continue
 				}
 				if ok := l.demux.Set(connKey, conn); !ok {
-					log.Printf("listener(info): connection already exists in demux map :%v\n", connKey)
+					logger.Info("listener: connection already exists in demux map", "connKey", connKey)
 				}
 				if err := conn.send(FlagSYN|FlagACK, nil, func(b []byte) error {
 					_, err := l.device.Write(b)
 					return err
 				}); err != nil {
-					log.Printf("listener(error): failed during write to device: %s", err.Error())
+					logger.Error("listener: failed to write to device", "error", err)
 					continue
 				}
 				conn.TCB.Snd.NXT = conn.TCB.Snd.ISS + 1
@@ -105,22 +124,22 @@ func Listen(local netip.AddrPort) (*Listener, error) {
 			case tcb.StateSynReceived:
 				// Tells us what it expects its position to be at
 				if seg.SeqNumber != conn.TCB.Recv.NXT {
-					log.Printf("listener(error): SEQ does not equal RCV.NXT %d!=%d\n", seg.SeqNumber, conn.TCB.Recv.NXT)
+					logger.Error("listener: SEQ does not equal RCV.NXT", "seq", seg.SeqNumber, "rcv.nxt", conn.TCB.Recv.NXT)
 					continue
 				}
 				// Tells us how much of our data it has processed
 				if seg.AckNumber != conn.TCB.Snd.NXT {
-					log.Printf("listener(error): ACK does not equal SND.NXT %d!=%d\n", seg.AckNumber, conn.TCB.Snd.NXT)
+					logger.Error("listener: ACK does not equal SND.NXT", "ack", seg.AckNumber, "snd.nxt", conn.TCB.Snd.NXT)
 					continue
 				}
 				switch seg.Flags {
 				case FlagACK:
 					break
 				case FlagRST:
-					log.Println("listener(warning): RST flag set, removing connection")
+					logger.Warn("listener: RST flag set, removing connection")
 					l.demux.Delete(connKey)
 				default:
-					log.Println("listener(error): ACK flag not set in segment")
+					logger.Error("listener: ACK flag not set in segment")
 					continue
 				}
 				conn.TCB.Snd.UNA = seg.AckNumber
@@ -138,6 +157,6 @@ func (l *Listener) Accept() (*Conn, error) {
 }
 
 func (l *Listener) Close() error {
-	log.Println("listener: closing device")
+	l.logger.Info("listener: closing device")
 	return l.device.Close()
 }
