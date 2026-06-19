@@ -1,65 +1,15 @@
 package tcp
 
 import (
+	"fmt"
 	"log"
 	"net/netip"
-	"slices"
 	"strconv"
 
 	"github.com/maxcelant/tcp-from-scratch/internal/ipv4"
 	"github.com/maxcelant/tcp-from-scratch/internal/tcb"
 	"github.com/maxcelant/tcp-from-scratch/internal/tun"
 )
-
-type Conn struct {
-	TCB *tcb.TCB
-	buf []byte
-}
-
-func (c *Conn) marshalTCP(dst []byte, flags uint8, payload []byte) ([]byte, error) {
-	return (Header{
-		SourcePort: c.TCB.Local.Port(),
-		DestPort:   c.TCB.Remote.Port(),
-		Flags:      flags,
-		Window:     c.TCB.Snd.WND,
-		SeqNumber:  c.TCB.Snd.NXT,
-		AckNumber:  c.TCB.Recv.NXT,
-		DataOffset: 5,
-	}).AppendMarshal(dst, c.TCB.Local.Addr(), c.TCB.Remote.Addr(), payload)
-}
-
-func (c *Conn) marshalIP(dst []byte, payloadSize uint16) ([]byte, error) {
-	i, err := (&ipv4.Header{
-		Version: 4,
-		IHL:     5,
-		// 20 bytes for IP header + 20 bytes for TCP header + payload
-		// TODO Make dynamic in a clean way
-		TotalLength: 40 + payloadSize,
-		TTL:         64,
-		Protocol:    ipv4.ProtoStrToUInt8[ipv4.ProtoTCP],
-		SourceAddr:  c.TCB.Local.Addr(),
-		DestAddr:    c.TCB.Remote.Addr(),
-		// + Identification, Flags/FragOffset=0, header checksum
-	}).Marshal(dst)
-	if err != nil {
-		return dst[:i], err
-	}
-	return dst[:i], nil
-
-}
-
-func (c *Conn) send(flags uint8, payload []byte, f func([]byte) error) error {
-	buf := make([]byte, 20)
-	buf, err := c.marshalIP(buf, uint16(len(payload)))
-	if err != nil {
-		return err
-	}
-	buf, err = c.marshalTCP(buf, flags, payload)
-	if err != nil {
-		return err
-	}
-	return f(slices.Concat(buf, payload))
-}
 
 type Listener struct {
 	local  netip.AddrPort
@@ -103,26 +53,16 @@ func Listen(local netip.AddrPort) (*Listener, error) {
 				log.Printf("listener(error): failure occured while parsing buffer: %s\n", err.Error())
 				continue
 			}
-			localAddrPort := netip.MustParseAddrPort(ip.DestAddr.String() + ":" + strconv.Itoa(int(seg.DestPort)))
-			remoteAddrPort := netip.MustParseAddrPort(ip.SourceAddr.String() + ":" + strconv.Itoa(int(seg.SourcePort)))
 			connKey := connKey{
-				local:  localAddrPort,
-				remote: remoteAddrPort,
+				local:  netip.MustParseAddrPort(fmt.Sprintf("%s:%s", ip.DestAddr.String(), strconv.Itoa(int(seg.DestPort)))),
+				remote: netip.MustParseAddrPort(fmt.Sprintf("%s:%s", ip.SourceAddr.String(), strconv.Itoa(int(seg.SourcePort)))),
 			}
 			var conn *Conn
 			conn, exists := l.demux.Get(connKey)
 			if !exists {
-				if localAddrPort != l.local {
-					continue // not addressed to us; ignore (later: RST)
-				}
-				if seg.Flags != FlagSYN {
-					// TODO Send RST
-					log.Println("listener(warning): received new connection without SYN flag")
-					continue
-				}
 				conn = &Conn{
 					TCB: &tcb.TCB{
-						State: tcb.StateSynReceived,
+						State: tcb.StateListen,
 						Snd: tcb.Send{
 							ISS: 0, // TODO Make this a random number
 							UNA: 0,
@@ -134,9 +74,21 @@ func Listen(local netip.AddrPort) (*Listener, error) {
 							WND: seg.Window,
 							IRS: seg.SeqNumber,
 						},
-						Local:  localAddrPort,
-						Remote: remoteAddrPort,
+						Local:  connKey.local,
+						Remote: connKey.remote,
 					},
+				}
+
+			}
+			switch conn.State() {
+			case tcb.StateListen:
+				if connKey.local != l.local {
+					continue // not addressed to us; ignore (later: RST)
+				}
+				if seg.Flags != FlagSYN {
+					// TODO Send RST
+					log.Println("listener(warning): received new connection without SYN flag")
+					continue
 				}
 				if ok := l.demux.Set(connKey, conn); !ok {
 					log.Printf("listener(info): connection already exists in demux map :%v\n", connKey)
@@ -149,14 +101,31 @@ func Listen(local netip.AddrPort) (*Listener, error) {
 					continue
 				}
 				conn.TCB.Snd.NXT = conn.TCB.Snd.ISS + 1
-			} else {
-				// if seg.AckNumber != conn.TCB.Snd.NXT {
-				// 	log.Printf("listener(error): ACK does not equal SND.NXT %d!=%d\n", seg.AckNumber, conn.TCB.Snd.NXT)
-				// 	continue
-				// }
-				// conn.TCB.Snd.UNA = seg.AckNumber
-				// conn.TCB.State = tcb.StateEstablished
-				// l.connCh <- conn
+				conn.TCB.State = tcb.StateSynReceived
+			case tcb.StateSynReceived:
+				// Tells us what it expects its position to be at
+				if seg.SeqNumber != conn.TCB.Recv.NXT {
+					log.Printf("listener(error): SEQ does not equal RCV.NXT %d!=%d\n", seg.SeqNumber, conn.TCB.Recv.NXT)
+					continue
+				}
+				// Tells us how much of our data it has processed
+				if seg.AckNumber != conn.TCB.Snd.NXT {
+					log.Printf("listener(error): ACK does not equal SND.NXT %d!=%d\n", seg.AckNumber, conn.TCB.Snd.NXT)
+					continue
+				}
+				switch seg.Flags {
+				case FlagACK:
+					break
+				case FlagRST:
+					log.Println("listener(warning): RST flag set, removing connection")
+					l.demux.Delete(connKey)
+				default:
+					log.Println("listener(error): ACK flag not set in segment")
+					continue
+				}
+				conn.TCB.Snd.UNA = seg.AckNumber
+				conn.TCB.State = tcb.StateEstablished
+				l.connCh <- conn
 			}
 
 		}

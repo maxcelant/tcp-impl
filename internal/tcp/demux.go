@@ -38,3 +38,9 @@ func (d *demux) Get(key connKey) (*Conn, bool) {
 	}
 	return v, true
 }
+
+func (d *demux) Delete(key connKey) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.m, key)
+}
