@@ -67,7 +67,7 @@ func Listen(ctx context.Context, local netip.AddrPort) (*Listener, error) {
 				logger.Debug("listener: packet protocol is not TCP, skipping")
 				continue
 			}
-			seg, payload, err := Parse(payload[:i])
+			seg, payload, err := Parse(payload)
 			if err != nil {
 				logger.Error("listener: failed to parse TCP segment", "error", err)
 				continue
@@ -80,6 +80,7 @@ func Listen(ctx context.Context, local netip.AddrPort) (*Listener, error) {
 			conn, exists := l.demux.Get(connKey)
 			if !exists {
 				conn = &Conn{
+					rcvBuf: NewRecvBuffer(),
 					TCB: &tcb.TCB{
 						State: tcb.StateListen,
 						Snd: tcb.Send{
@@ -97,7 +98,6 @@ func Listen(ctx context.Context, local netip.AddrPort) (*Listener, error) {
 						Remote: connKey.remote,
 					},
 				}
-
 			}
 			switch conn.State() {
 			case tcb.StateListen:
@@ -110,7 +110,7 @@ func Listen(ctx context.Context, local netip.AddrPort) (*Listener, error) {
 					continue
 				}
 				if ok := l.demux.Set(connKey, conn); !ok {
-					logger.Info("listener: connection already exists in demux map", "connKey", connKey)
+					logger.Info("listener: connection already exists in demux map", "connKey", connKey, "state", conn.State().String())
 				}
 				if err := conn.send(FlagSYN|FlagACK, nil, func(b []byte) error {
 					_, err := l.device.Write(b)
@@ -122,14 +122,23 @@ func Listen(ctx context.Context, local netip.AddrPort) (*Listener, error) {
 				conn.TCB.Snd.NXT = conn.TCB.Snd.ISS + 1
 				conn.TCB.State = tcb.StateSynReceived
 			case tcb.StateSynReceived:
-				// Tells us what it expects its position to be at
+				// Tells us what the remote expects its position to be at
+				// If it isn't correct, then we must have some out of order issue, we will handle this later
 				if seg.SeqNumber != conn.TCB.Recv.NXT {
-					logger.Error("listener: SEQ does not equal RCV.NXT", "seq", seg.SeqNumber, "rcv.nxt", conn.TCB.Recv.NXT)
+					logger.Warn("listener: SEQ does not equal RCV.NXT", "seq", seg.SeqNumber, "rcv.nxt", conn.TCB.Recv.NXT, "state", conn.State().String())
+					// Drop the payload and resend an ACK
+					if err := conn.send(FlagACK, nil, func(b []byte) error {
+						_, err := l.device.Write(b)
+						return err
+					}); err != nil {
+						logger.Error("listener: failed to write to device", "error", err)
+						continue
+					}
 					continue
 				}
-				// Tells us how much of our data it has processed
+				// Tells us how much of our data the remote has processed
 				if seg.AckNumber != conn.TCB.Snd.NXT {
-					logger.Error("listener: ACK does not equal SND.NXT", "ack", seg.AckNumber, "snd.nxt", conn.TCB.Snd.NXT)
+					logger.Error("listener: ACK does not equal SND.NXT", "ack", seg.AckNumber, "snd.nxt", conn.TCB.Snd.NXT, "state", conn.State().String())
 					continue
 				}
 				switch seg.Flags {
@@ -145,6 +154,32 @@ func Listen(ctx context.Context, local netip.AddrPort) (*Listener, error) {
 				conn.TCB.Snd.UNA = seg.AckNumber
 				conn.TCB.State = tcb.StateEstablished
 				l.connCh <- conn
+			case tcb.StateEstablished:
+				if seg.SeqNumber != conn.TCB.Recv.NXT {
+					logger.Warn("listener: SEQ does not equal RCV.NXT", "seq", seg.SeqNumber, "rcv.nxt", conn.TCB.Recv.NXT, "state", conn.State().String())
+					// Drop the payload and resend an ACK
+					if err := conn.send(FlagACK, nil, func(b []byte) error {
+						_, err := l.device.Write(b)
+						return err
+					}); err != nil {
+						logger.Error("listener: failed to write to device", "error", err)
+						continue
+					}
+					continue
+				}
+				conn.rcvBuf.Write(payload)
+				conn.TCB.Recv.NXT += uint32(len(payload))
+				logger.Debug("connection", "RCV.NXT", conn.TCB.Recv.NXT, "state", conn.State().String())
+				if err := conn.send(FlagACK, nil, func(b []byte) error {
+					_, err := l.device.Write(b)
+					return err
+				}); err != nil {
+					logger.Error("listener: failed to write to device", "error", err)
+					continue
+				}
+				// if InRange(seg.AckNumber, conn.TCB.Snd.NXT, conn.TCB.Snd.UNA) {
+				//
+				// }
 			}
 
 		}

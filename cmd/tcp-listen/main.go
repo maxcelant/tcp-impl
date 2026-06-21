@@ -1,26 +1,28 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"log"
+	"log/slog"
 	"net/netip"
+	"os"
 
 	"github.com/maxcelant/tcp-from-scratch/internal/tcp"
 )
 
 func main() {
-	ln, err := tcp.Listen(netip.MustParseAddrPort("10.0.0.2:7777"))
+	ctx := context.Background()
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	ln, err := tcp.Listen(tcp.WithLogger(ctx, logger), netip.MustParseAddrPort("10.0.0.2:7777"))
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println("listening on 10.0.0.2:7777")
+	logger.Info("listening", "address", "10.0.0.2", "port", "7777")
 	for {
-		// Accept blocks; it won't return until ESTABLISHED (L08).
-		// The read loop inside Listen still emits the SYN/ACK.
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Printf("Conn State: %s\n", conn.State())
+		logger.Info("connection made", "conn state", conn.State().String())
 	}
 }

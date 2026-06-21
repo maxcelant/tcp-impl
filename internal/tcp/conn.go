@@ -10,9 +10,14 @@ import (
 
 type Conn struct {
 	TCB *tcb.TCB
-	buf []byte
 
-	mu sync.RWMutex
+	rcvBuf *RecvBuffer
+	mu     sync.RWMutex
+	closed bool
+}
+
+func (c *Conn) Read(p []byte) (int, error) {
+	return c.rcvBuf.Read(p)
 }
 
 func (c *Conn) State() tcb.State {
