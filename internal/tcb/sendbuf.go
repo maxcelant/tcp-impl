@@ -27,15 +27,23 @@ func (s *SendBuffer) Acked(ack uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	i := ack - s.start
-	s.buf = s.buf[i:]
+	if len(s.buf) != 0 {
+		s.buf = s.buf[i:]
+	}
 	s.start = ack
 }
 
-func (s *SendBuffer) NextChunk(size uint16) ([]byte, uint16) {
+func (s *SendBuffer) NextChunk(next uint32, window uint16) ([]byte, uint16) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if size > uint16(len(s.buf)) {
-		size = uint16(len(s.buf))
+	sent := next - s.start
+	// Tells us whats already been sent
+	// If we've sent everything in the buffer thus far, then we can return
+	if sent >= uint32(len(s.buf)) {
+		return nil, 0
 	}
-	return s.buf[:size], size
+	// If there's a chunk to send then send the size of the min(buffer, window)
+	chunk := s.buf[sent:]
+	size := min(len(chunk), int(window))
+	return chunk[:size], uint16(size)
 }

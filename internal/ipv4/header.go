@@ -46,8 +46,8 @@ var (
 	ErrUnidentifiedProtocol = errors.New("ipv4: protocol identified is unknown")
 )
 
-func Parse(raw []byte) (Header, []byte, error) {
-	h := Header{}
+func Parse(raw []byte) (*Header, []byte, error) {
+	h := &Header{}
 	if len(raw) < HeaderMinLength {
 		return h, nil, ErrTooShort
 	}

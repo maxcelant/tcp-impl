@@ -8,7 +8,6 @@ import (
 	"strconv"
 
 	"github.com/maxcelant/tcp-from-scratch/internal/ipv4"
-	"github.com/maxcelant/tcp-from-scratch/internal/tcb"
 	"github.com/maxcelant/tcp-from-scratch/internal/tun"
 )
 
@@ -58,128 +57,43 @@ func Listen(ctx context.Context, local netip.AddrPort) (*Listener, error) {
 				logger.Error("listener: failed to read from device", "name", l.device.Name(), "error", err.Error())
 				return
 			}
-			ip, payload, err := ipv4.Parse(buf[:i])
+			ipheader, payload, err := ipv4.Parse(buf[:i])
 			if err != nil {
 				logger.Error("listener: failed to parse IP packet", "error", err)
 				continue
 			}
-			if !ip.IsProtocol(ipv4.ProtoTCP) {
+			if !ipheader.IsProtocol(ipv4.ProtoTCP) {
 				logger.Debug("listener: packet protocol is not TCP, skipping")
 				continue
 			}
-			seg, payload, err := Parse(payload)
+			tcpheader, payload, err := Parse(payload)
 			if err != nil {
 				logger.Error("listener: failed to parse TCP segment", "error", err)
 				continue
 			}
 			connKey := connKey{
-				local:  netip.MustParseAddrPort(fmt.Sprintf("%s:%s", ip.DestAddr.String(), strconv.Itoa(int(seg.DestPort)))),
-				remote: netip.MustParseAddrPort(fmt.Sprintf("%s:%s", ip.SourceAddr.String(), strconv.Itoa(int(seg.SourcePort)))),
+				local:  netip.MustParseAddrPort(fmt.Sprintf("%s:%s", ipheader.DestAddr.String(), strconv.Itoa(int(tcpheader.DestPort)))),
+				remote: netip.MustParseAddrPort(fmt.Sprintf("%s:%s", ipheader.SourceAddr.String(), strconv.Itoa(int(tcpheader.SourcePort)))),
+			}
+			if connKey.local != l.local {
+				logger.Error("listener: connection address does not match listener address", "listenerAddr", l.local)
+				continue
 			}
 			var conn *Conn
 			conn, exists := l.demux.Get(connKey)
 			if !exists {
-				conn = &Conn{
-					device: d,
-					rcvBuf: tcb.NewRecvBuffer(),
-					sndBuf: tcb.NewSendBuffer(1), // TODO Use ISS
-					TCB: &tcb.TCB{
-						State: tcb.StateListen,
-						Snd: tcb.Send{
-							ISS: 0, // TODO Make this a random number
-							UNA: 0,
-							WND: 1460,
-							NXT: 0,
-						},
-						Recv: tcb.Receive{
-							NXT: seg.SeqNumber + 1,
-							WND: seg.Window,
-							IRS: seg.SeqNumber,
-						},
-						Local:  connKey.local,
-						Remote: connKey.remote,
-					},
-				}
-			}
-			switch conn.State() {
-			case tcb.StateListen:
-				if connKey.local != l.local {
-					continue // not addressed to us; ignore (later: RST)
-				}
-				if seg.Flags != FlagSYN {
-					// TODO Send RST
-					logger.Warn("listener: received new connection without SYN flag")
-					continue
-				}
+				conn = NewConn(ConnOpts{
+					logger:   logger,
+					device:   d,
+					key:      connKey,
+					acceptCh: l.connCh,
+				})
 				if ok := l.demux.Set(connKey, conn); !ok {
 					logger.Info("listener: connection already exists in demux map", "connKey", connKey, "state", conn.State().String())
-				}
-				if err := conn.send(FlagSYN | FlagACK); err != nil {
-					logger.Error("listener: failed to write to device", "error", err)
-					continue
-				}
-				conn.TCB.Snd.NXT = conn.TCB.Snd.ISS + 1
-				conn.TCB.State = tcb.StateSynReceived
-			case tcb.StateSynReceived:
-				// Tells us what the remote expects its position to be at
-				// If it isn't correct, then we must have some out of order issue, we will handle this later
-				if seg.SeqNumber != conn.TCB.Recv.NXT {
-					logger.Warn("listener: SEQ does not equal RCV.NXT", "seq", seg.SeqNumber, "rcv.nxt", conn.TCB.Recv.NXT, "state", conn.State().String())
-					// Drop the payload and resend an ACK
-					if err := conn.send(FlagACK); err != nil {
-						logger.Error("listener: failed to write to device", "error", err)
-						continue
-					}
-					continue
-				}
-				// Tells us how much of our data the remote has processed
-				if seg.AckNumber != conn.TCB.Snd.NXT {
-					logger.Error("listener: ACK does not equal SND.NXT", "ack", seg.AckNumber, "snd.nxt", conn.TCB.Snd.NXT, "state", conn.State().String())
-					continue
-				}
-				switch seg.Flags {
-				case FlagACK:
-					break
-				case FlagRST:
-					logger.Warn("listener: RST flag set, removing connection")
-					l.demux.Delete(connKey)
-				default:
-					logger.Error("listener: ACK flag not set in segment")
-					continue
-				}
-				conn.TCB.Snd.UNA = seg.AckNumber
-				conn.TCB.State = tcb.StateEstablished
-				l.connCh <- conn
-			case tcb.StateEstablished:
-				if seg.SeqNumber < conn.TCB.Recv.NXT {
-					logger.Warn("listener: SEQ does not equal RCV.NXT", "seq", seg.SeqNumber, "rcv.nxt", conn.TCB.Recv.NXT, "state", conn.State().String())
-					// Drop the payload and resend an ACK
-					if err := conn.send(FlagACK); err != nil {
-						logger.Error("listener: failed to write to device", "error", err)
-						continue
-					}
-					continue
-				}
-				// We have some payload to send to the remote
-				if conn.TCB.Snd.UNA < seg.AckNumber && seg.AckNumber <= conn.TCB.Snd.NXT {
-					conn.TCB.Snd.UNA = seg.AckNumber
-					conn.sndBuf.Acked(seg.AckNumber)
-					conn.TCB.Snd.WND = seg.Window
-					logger.Debug("sending data to remote", "SND.NXT", conn.TCB.Snd.NXT, "state", conn.State().String())
-				}
-				// Got some payload, and we need to send it to the connection buffer
-				if len(payload) > 0 {
-					conn.rcvBuf.Write(payload)
-					conn.TCB.Recv.NXT += uint32(len(payload))
-					logger.Debug("retrieving data from remote", "RCV.NXT", conn.TCB.Recv.NXT, "state", conn.State().String())
-				}
-
-				if err := conn.send(FlagACK); err != nil {
-					logger.Error("listener: failed to write to device", "error", err)
 					continue
 				}
 			}
-
+			conn.segCh <- &Segment{ipheader, tcpheader, payload}
 		}
 	}()
 	return l, nil
